@@ -42,6 +42,7 @@ class TimelineWorld {
   constructor(private readonly observeMembership?: ViewedTimelineSyncPorts["observe"]) {}
   readonly errors: string[] = [];
   readonly releasedMemberships: string[][] = [];
+  readonly releasedTimelines: string[] = [];
   readonly cursors = new Map<string, { epoch: string; endSeq: number }>();
   readonly cacheRequests: string[] = [];
   readonly forcedTimelineTailReplacements = new Set<string>();
@@ -118,6 +119,9 @@ class TimelineWorld {
         const index = this.scheduled.indexOf(scheduled);
         if (index >= 0) this.scheduled.splice(index, 1);
       };
+    },
+    releaseAgentTimeline: (agentId) => {
+      this.releasedTimelines.push(agentId);
     },
   });
 
@@ -976,4 +980,24 @@ test("disposing a view releases its pending observation before bootstrap complet
   request.succeed();
   await Promise.resolve();
   world.expectNoPendingFetch();
+});
+
+test("releases the retained timeline when an agent leaves the desired set", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const membership = await world.nextMembership();
+  membership.succeed();
+  const fetch = await world.nextFetch("agent-a");
+  fetch.respond({ hasNewer: false });
+  expect(world.releasedTimelines).toEqual([]);
+
+  // While disconnected the desired set tracks visible panes directly (no hot
+  // budget), so replacing the visible agent drops the previous one and the
+  // retained in-memory timeline is released back to the replica row store.
+  world.sync.setConnected(false);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-b"]);
+
+  expect(world.releasedTimelines).toEqual(["agent-a"]);
+  expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("pending");
 });

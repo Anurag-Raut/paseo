@@ -319,6 +319,8 @@ export interface ViewedTimelineSyncPorts {
   fetchLatestTail(agentId: string): Promise<TimelinePageResult>;
   reportError(error: unknown): void;
   schedule(task: () => void, delayMs: number): () => void;
+  /** Optional: drop an agent's retained in-memory timeline once it leaves the desired set (#479). */
+  releaseAgentTimeline?(agentId: string): void;
 }
 
 export type ViewedTimelineStatus = "ready" | "pending" | "error" | "retrying";
@@ -766,6 +768,10 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
         visibilityCatchUpPending.delete(agentId);
         visibilityCatchUpErrors.delete(agentId);
         manualRetries.delete(agentId);
+        // The agent's items are already mirrored into the replica row store, so
+        // dropping the in-memory timeline is lossless: reopening rehydrates via
+        // prepareCachedTimeline, which is the same path an app restart takes.
+        ports.releaseAgentTimeline?.(agentId);
       }
     }
     for (const agentId of nextDesired) {

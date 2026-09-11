@@ -267,6 +267,40 @@ describe("agent timeline state", () => {
     });
   });
 
+  it("releases a non-viewed agent's retained timeline back to cold", () => {
+    initializeTestSession();
+    const store = useSessionStore.getState();
+    const items: StreamItem[] = [
+      {
+        kind: "assistant_message",
+        id: "canonical-row",
+        text: "canonical",
+        timestamp: new Date("2026-07-27T10:00:00.000Z"),
+      },
+    ];
+    store.applyAgentTimelineResponseState("test-server", "agent-1", {
+      items,
+      head: [],
+      range: { epoch: "epoch-1", startSeq: 51, endSeq: 100 },
+      older: "available",
+      newer: false,
+      synchronized: true,
+      acknowledgedClientMessageIds: [],
+    });
+    expect(store.getSession("test-server")?.agentAuthoritativeHistoryApplied.get("agent-1")).toBe(
+      true,
+    );
+
+    store.releaseAgentTimeline("test-server", "agent-1");
+
+    const session = store.getSession("test-server");
+    expect(session?.agentStreamTail.has("agent-1")).toBe(false);
+    expect(session?.agentAuthoritativeHistoryApplied.has("agent-1")).toBe(false);
+    expect(
+      selectAgentTimelineState(useSessionStore.getState().sessions["test-server"], "agent-1"),
+    ).toEqual({ status: "cold" });
+  });
+
   it("stores turn liveness transitions without duplicating their policy", () => {
     initializeTestSession();
     const store = useSessionStore.getState();

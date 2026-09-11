@@ -510,6 +510,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
         const timeout = setTimeout(task, delayMs);
         return () => clearTimeout(timeout);
       },
+      releaseAgentTimeline: (agentId) => {
+        useSessionStore.getState().releaseAgentTimeline(serverId, agentId);
+      },
     });
     viewedTimelineSyncRef.current = sync;
     setViewedTimelineSync(serverId, sync);

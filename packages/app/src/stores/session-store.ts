@@ -496,6 +496,8 @@ interface SessionStoreActions {
     message: UserMessageItem,
   ) => boolean;
   clearAgentStreamHead: (serverId: string, agentId: string) => void;
+  /** Drops an agent's retained timeline when it is no longer viewed (#479). */
+  releaseAgentTimeline: (serverId: string, agentId: string) => void;
   setAgentTimelineCursor: (
     serverId: string,
     state:
@@ -1216,6 +1218,53 @@ export const useSessionStore = create<SessionStore>()(
             sessions: {
               ...prev.sessions,
               [serverId]: { ...session, agentStreamHead: nextHead },
+            },
+          };
+        });
+      },
+
+      releaseAgentTimeline: (serverId, agentId) => {
+        set((prev) => {
+          const session = prev.sessions[serverId];
+          if (!session) {
+            return prev;
+          }
+          const holds =
+            session.agentStreamTail.has(agentId) ||
+            session.agentStreamHead.has(agentId) ||
+            session.agentTimelineCursor.has(agentId) ||
+            session.agentTimelineHasOlder.has(agentId) ||
+            session.agentTimelineHasNewer.has(agentId) ||
+            session.agentTimelineOlderFetchInFlight.has(agentId) ||
+            session.agentHistorySyncGeneration.has(agentId) ||
+            session.agentAuthoritativeHistoryApplied.get(agentId) === true;
+          if (!holds) {
+            return prev;
+          }
+          const drop = <V>(map: Map<string, V>): Map<string, V> => {
+            const next = new Map(map);
+            next.delete(agentId);
+            return next;
+          };
+          // Every dropped field re-hydrates on reopen: the replica row store
+          // mirrors the tail (capped) plus the cursor, and the authoritative
+          // history then re-syncs. Keeping applied/cursor state while emptying
+          // items would leave the agent looking synced with no history.
+          return {
+            ...prev,
+            sessions: {
+              ...prev.sessions,
+              [serverId]: {
+                ...session,
+                agentStreamTail: drop(session.agentStreamTail),
+                agentStreamHead: drop(session.agentStreamHead),
+                agentTimelineCursor: drop(session.agentTimelineCursor),
+                agentTimelineHasOlder: drop(session.agentTimelineHasOlder),
+                agentTimelineHasNewer: drop(session.agentTimelineHasNewer),
+                agentTimelineOlderFetchInFlight: drop(session.agentTimelineOlderFetchInFlight),
+                agentHistorySyncGeneration: drop(session.agentHistorySyncGeneration),
+                agentAuthoritativeHistoryApplied: drop(session.agentAuthoritativeHistoryApplied),
+              },
             },
           };
         });
