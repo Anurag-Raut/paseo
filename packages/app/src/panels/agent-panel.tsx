@@ -126,6 +126,9 @@ interface ChatAgentStateShape {
 }
 
 const RECONNECT_TOAST_DELAY_MS = 1_000;
+const MISSING_AGENT_FETCH_TIMEOUT_MS = 15_000;
+const MISSING_AGENT_RETRY_BASE_MS = 1_000;
+const MISSING_AGENT_MAX_AUTO_RETRIES = 3;
 
 const reconnectToastStateByServerId = new Map<string, ReconnectToastState>();
 
@@ -497,6 +500,16 @@ function findActiveCreateHandoff(input: {
   );
 }
 
+/** Rejects with `message` when the promise has not settled within timeoutMs. */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let rejectTimedOut: ((error: Error) => void) | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    rejectTimedOut = reject;
+  });
+  const timer = setTimeout(() => rejectTimedOut?.(new Error(message)), timeoutMs);
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 function toErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -793,6 +806,8 @@ function ChatAgentContent({
   const wasPaneFocusedRef = useRef(isPaneFocused);
   const reconnectToastPresentedRef = useRef(false);
   const initAttemptTokenRef = useRef(0);
+  const initAutoRetryCountRef = useRef(0);
+  const initAutoRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const routeBottomAnchorRequestRef = useRef<{
     routeKey: string;
     reason: "initial-entry" | "resume";
@@ -1052,6 +1067,7 @@ function ChatAgentContent({
   }, []);
 
   const retryAgentLoad = useCallback(() => {
+    initAutoRetryCountRef.current = 0;
     setMissingAgentState({ kind: "idle" });
     if (!agentId || !viewedTimelineSync) return;
     viewedTimelineSync.retryVisibleAgentTimeline(agentId);
@@ -1064,7 +1080,14 @@ function ChatAgentContent({
 
   useEffect(() => {
     initAttemptTokenRef.current += 1;
+    initAutoRetryCountRef.current = 0;
     setMissingAgentState({ kind: "idle" });
+    return () => {
+      if (initAutoRetryTimerRef.current) {
+        clearTimeout(initAutoRetryTimerRef.current);
+        initAutoRetryTimerRef.current = null;
+      }
+    };
   }, [agentId, serverId]);
 
   useEffect(() => {
@@ -1080,7 +1103,11 @@ function ChatAgentContent({
         missingAgentState.kind === "not_found" ||
         missingAgentState.kind === "error"
       ) {
-        setMissingAgentState(reconcileMissingAgentStateWithPresentAgent);
+        setMissingAgentState((state) =>
+          reconcileMissingAgentStateWithPresentAgent(state, {
+            hasAppliedAuthoritativeHistory,
+          }),
+        );
       }
       return;
     }
@@ -1105,45 +1132,73 @@ function ChatAgentContent({
     setMissingAgentState({ kind: "resolving" });
     const attemptToken = ++initAttemptTokenRef.current;
 
-    Promise.resolve()
-      .then(async () => {
-        if (attemptToken !== initAttemptTokenRef.current) {
-          return;
-        }
-        const currentSession = useSessionStore.getState().sessions[serverId];
-        const currentAgent =
-          currentSession?.agents.get(agentId) ?? currentSession?.agentDetails.get(agentId);
-        if (!currentAgent) {
-          const result = await client.fetchAgent({ agentId });
-          if (attemptToken !== initAttemptTokenRef.current) {
-            return;
-          }
-          if (!result) {
-            setMissingAgentState({
-              kind: "not_found",
-              message: `Agent not found: ${agentId}`,
-            });
-            return;
-          }
-          storeFetchedAgentDetail({ serverId, result });
-        }
-        if (attemptToken !== initAttemptTokenRef.current) {
-          return;
-        }
-        setMissingAgentState({ kind: "idle" });
+    const attemptFetch = async (): Promise<void> => {
+      if (attemptToken !== initAttemptTokenRef.current) {
         return;
-      })
-      .catch((error) => {
+      }
+      const currentSession = useSessionStore.getState().sessions[serverId];
+      const currentAgent =
+        currentSession?.agents.get(agentId) ?? currentSession?.agentDetails.get(agentId);
+      if (!currentAgent) {
+        const result = await withTimeout(
+          client.fetchAgent({ agentId }),
+          MISSING_AGENT_FETCH_TIMEOUT_MS,
+          "Agent fetch timed out",
+        );
         if (attemptToken !== initAttemptTokenRef.current) {
           return;
         }
-        const message = toErrorMessage(error);
-        if (isNotFoundErrorMessage(message)) {
-          setMissingAgentState({ kind: "not_found", message });
+        if (!result) {
+          setMissingAgentState({
+            kind: "not_found",
+            message: `Agent not found: ${agentId}`,
+          });
           return;
         }
+        storeFetchedAgentDetail({ serverId, result });
+      }
+      if (attemptToken !== initAttemptTokenRef.current) {
+        return;
+      }
+      setMissingAgentState({ kind: "idle" });
+    };
+
+    const runFetchAttempt = async (): Promise<void> => {
+      try {
+        await attemptFetch();
+      } catch (error) {
+        handleFetchFailure(error);
+      }
+    };
+
+    const handleFetchFailure = (error: unknown): void => {
+      if (attemptToken !== initAttemptTokenRef.current) {
+        return;
+      }
+      const message = toErrorMessage(error);
+      if (isNotFoundErrorMessage(message)) {
+        setMissingAgentState({ kind: "not_found", message });
+        return;
+      }
+      // Bounded backoff keeps a transient daemon hiccup (#1828) from wedging
+      // the panel: stay on the resolving spinner while retries run, surface
+      // the error view once the budget is spent. retryAgentLoad resets it.
+      const retriesUsed = initAutoRetryCountRef.current;
+      if (retriesUsed >= MISSING_AGENT_MAX_AUTO_RETRIES) {
         setMissingAgentState({ kind: "error", message });
-      });
+        return;
+      }
+      initAutoRetryCountRef.current = retriesUsed + 1;
+      initAutoRetryTimerRef.current = setTimeout(() => {
+        initAutoRetryTimerRef.current = null;
+        if (attemptToken !== initAttemptTokenRef.current) {
+          return;
+        }
+        void runFetchAttempt();
+      }, MISSING_AGENT_RETRY_BASE_MS << retriesUsed);
+    };
+
+    void runFetchAttempt();
   }, [
     agentState.id,
     agentState.archivedAt,

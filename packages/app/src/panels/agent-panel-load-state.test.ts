@@ -18,13 +18,30 @@ describe("reconcileMissingAgentStateWithPresentAgent", () => {
     ).toEqual({ kind: "idle" });
   });
 
-  it("preserves history sync errors while the agent record is present", () => {
+  it("preserves history sync errors while the timeline has not applied", () => {
     const state: AgentScreenMissingState = {
       kind: "error",
       message: "Failed to get logs: session is archived",
     };
 
+    expect(
+      reconcileMissingAgentStateWithPresentAgent(state, {
+        hasAppliedAuthoritativeHistory: false,
+      }),
+    ).toBe(state);
     expect(reconcileMissingAgentStateWithPresentAgent(state)).toBe(state);
+  });
+
+  it("clears a history sync error once the timeline has applied so the panel recovers", () => {
+    expect(
+      reconcileMissingAgentStateWithPresentAgent(
+        {
+          kind: "error",
+          message: "Failed to get logs: session is archived",
+        },
+        { hasAppliedAuthoritativeHistory: true },
+      ),
+    ).toEqual({ kind: "idle" });
   });
 });
 
