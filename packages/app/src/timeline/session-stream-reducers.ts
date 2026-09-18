@@ -1635,9 +1635,15 @@ export function processAgentStreamEvent(
         unmatchedUserMessageInsert: "head",
       });
     } else {
+      // Overlay live events onto the painted head before the first authoritative
+      // page arrives. Keep the painted head as the streaming head (not as the
+      // tail) so streamable items merge with what is already painted: treating it
+      // as tail started a fresh empty head per event, which split one reasoning
+      // stream into one "Thinking" row per chunk (#4509 for providers that have
+      // no authoritative baseline yet, e.g. right after eviction/fork/import).
       const overlay = applyStreamEvent({
-        tail: currentHead,
-        head: [],
+        tail: [],
+        head: currentHead,
         event,
         timestamp,
         source: "live",

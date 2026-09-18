@@ -3924,6 +3924,50 @@ describe("processAgentStreamEvents", () => {
     expect(result.sideEffects).toEqual([]);
   });
 
+  it("merges contiguous reasoning events into one thought before the authoritative baseline", () => {
+    const result = processAgentStreamEvents({
+      events: [
+        makeStreamReducerEvent(makeTimelineEvent("Let me ", "reasoning"), 1),
+        makeStreamReducerEvent(makeTimelineEvent("think ", "reasoning"), 2),
+        makeStreamReducerEvent(makeTimelineEvent("about it.", "reasoning"), 3),
+      ],
+      currentTail: [],
+      currentHead: [],
+      currentCursor: undefined,
+      hasAuthoritativeBaseline: false,
+    });
+
+    expect(result.changedTail).toBe(false);
+    expect(result.changedHead).toBe(true);
+    expect(result.tail).toEqual([]);
+    const thoughts = result.head.filter((item) => item.kind === "thought");
+    expect(thoughts).toHaveLength(1);
+    expect(thoughts[0]).toMatchObject({ kind: "thought", text: "Let me think about it." });
+  });
+
+  it("merges live reasoning into the painted head thought before the authoritative baseline", () => {
+    const painted: StreamItem[] = [
+      {
+        kind: "thought",
+        id: "thought-painted",
+        text: "painted ",
+        timestamp: new Date(1000),
+        status: "loading",
+      },
+    ];
+    const result = processAgentStreamEvents({
+      events: [makeStreamReducerEvent(makeTimelineEvent("live", "reasoning"), 51)],
+      currentTail: [],
+      currentHead: painted,
+      currentCursor: undefined,
+      hasAuthoritativeBaseline: false,
+    });
+
+    const thoughts = result.head.filter((item) => item.kind === "thought");
+    expect(thoughts).toHaveLength(1);
+    expect(thoughts[0]).toMatchObject({ kind: "thought", text: "painted live" });
+  });
+
   it("keeps matching assistant message ids in the live head", () => {
     const result = processAgentStreamEvents({
       events: [
