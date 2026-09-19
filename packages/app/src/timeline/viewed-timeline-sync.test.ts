@@ -654,6 +654,26 @@ test("redeclaring unchanged visibility does not bypass catch-up backoff", async 
   expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("error");
 });
 
+test("a cache load that never settles does not block the catch-up", async () => {
+  const world = new TimelineWorld();
+  world.cacheGate = deferred<void>();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const membership = await world.nextMembership();
+  membership.succeed();
+
+  expect(world.pendingFetchCount).toBe(0);
+
+  world.elapse(3_000);
+
+  const fetch = await world.nextFetch("agent-a");
+  expect(fetch.request).toEqual({ direction: "tail", limit: 40, projection: "projected" });
+  fetch.respond({ hasNewer: false });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+
+  world.cacheGate.resolve();
+});
+
 test("a retry re-issues the request that failed instead of re-planning it", async () => {
   const world = new TimelineWorld();
   world.cursors.set("agent-a", { epoch: "cached-epoch", endSeq: 17 });

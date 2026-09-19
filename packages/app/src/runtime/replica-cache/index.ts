@@ -1477,7 +1477,13 @@ export class ReplicaCache {
       await this.rowStore.open();
       // COMPAT(replica-blob-cache): remove after 2026-11
       await this.clearLegacyCache().catch(() => undefined);
-    })();
+    })().catch((error) => {
+      // Memoizing the rejection disabled the cache for the rest of the session, so one
+      // failed open — a transient IndexedDB fault, say — meant nothing was ever stored
+      // again. Forget the attempt so the next read retries it.
+      this.preparePromise = null;
+      throw error;
+    });
     return this.preparePromise;
   }
 

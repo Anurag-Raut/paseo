@@ -407,6 +407,8 @@ export function createViewedTimelineOwner(input: {
 }
 
 const RETRY_DELAY_MS = 1_000;
+// Ceiling on waiting for the durable cache before the authoritative request runs anyway.
+const CACHE_LOAD_TIMEOUT_MS = 3_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 const VIEWED_TIMELINE_HOT_AGENT_LIMIT = 5;
 
@@ -624,14 +626,29 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
 
   const ensureCacheLoaded = (agentId: string): void => {
     if (loadedCache.has(agentId) || cacheLoads.has(agentId)) return;
+    let settled = false;
+    const finish = () => {
+      cacheLoads.delete(agentId);
+      loadedCache.add(agentId);
+      const pending = pendingCatchUps.get(agentId);
+      startCatchUp(agentId, { request: pending, supersede: Boolean(pending) });
+    };
+    // The cache only shortens the authoritative request. A read that never settles — a
+    // wedged IndexedDB transaction, say — must not hold the catch-up hostage and leave
+    // the agent on its loading state with nothing the user can retry.
+    const cancelTimeout = ports.schedule(() => {
+      if (settled) return;
+      settled = true;
+      finish();
+    }, CACHE_LOAD_TIMEOUT_MS);
     const load = ports
       .prepare(agentId)
       .catch((error) => ports.reportError(error))
       .finally(() => {
-        cacheLoads.delete(agentId);
-        loadedCache.add(agentId);
-        const pending = pendingCatchUps.get(agentId);
-        startCatchUp(agentId, { request: pending, supersede: Boolean(pending) });
+        cancelTimeout();
+        if (settled) return;
+        settled = true;
+        finish();
       });
     cacheLoads.set(agentId, load);
   };
