@@ -370,6 +370,17 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const [expandedInlineToolCallIds, setExpandedInlineToolCallIds] = useState<Set<string>>(
       new Set(),
     );
+    // A row owns its expansion state, so the same item rendered in another lane — which is
+    // what a completed turn does when the live head flushes into the history lane — remounts
+    // and would re-open collapsed, discarding what the reader had open. Remember the reader's
+    // choice per item so a remounted row re-opens where it left off.
+    const [inlineDetailsExpansionByItemId, setInlineDetailsExpansionByItemId] = useState<
+      Map<string, boolean>
+    >(new Map());
+    const readInlineDetailsExpansion = useCallback(
+      (itemId: string): boolean | undefined => inlineDetailsExpansionByItemId.get(itemId),
+      [inlineDetailsExpansionByItemId],
+    );
     const [expandedToolCallGroupIds, setExpandedToolCallGroupIds] = useState<Set<string>>(
       new Set(),
     );
@@ -668,6 +679,12 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     const setInlineDetailsExpanded = useCallback(
       (itemId: string, expanded: boolean) => {
+        setInlineDetailsExpansionByItemId((previous) => {
+          if (previous.get(itemId) === expanded) return previous;
+          const next = new Map(previous);
+          next.set(itemId, expanded);
+          return next;
+        });
         if (!streamRenderStrategy.shouldDisableParentScrollOnInlineDetailsExpansion()) {
           return;
         }
@@ -756,11 +773,11 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             text={item.text}
             status={item.status}
             isLastInSequence={layoutItem.isLastInToolSequence}
-            defaultExpanded={autoExpandReasoning}
+            defaultExpanded={readInlineDetailsExpansion(item.id) ?? autoExpandReasoning}
           />
         );
       },
-      [autoExpandReasoning, setInlineDetailsExpanded],
+      [autoExpandReasoning, readInlineDetailsExpansion, setInlineDetailsExpanded],
     );
 
     const renderSingleToolCallItem = useCallback(
@@ -789,6 +806,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             <ToolCallSlot
               itemId={item.id}
               onInlineDetailsExpandedChangeByItemId={setInlineDetailsExpanded}
+              defaultExpanded={readInlineDetailsExpansion(item.id)}
               toolName={data.name}
               error={data.error}
               status={data.status}
@@ -807,6 +825,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           <ToolCallSlot
             itemId={item.id}
             onInlineDetailsExpandedChangeByItemId={setInlineDetailsExpanded}
+            defaultExpanded={readInlineDetailsExpansion(item.id)}
             toolName={data.toolName}
             args={data.arguments}
             result={data.result}
@@ -817,7 +836,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           />
         );
       },
-      [context.cwd, setInlineDetailsExpanded, handleToolCallOpenFile],
+      [context.cwd, readInlineDetailsExpansion, setInlineDetailsExpanded, handleToolCallOpenFile],
     );
 
     // Read through a stable event so live group updates do not change the renderer identity
