@@ -125,8 +125,13 @@ export function createIndexedDbReplicaRowStore(
   async function readAll(): Promise<ReplicaHostRows[]> {
     const transaction = getDatabase().transaction(ROWS_STORE, "readonly");
     const completion = transactionComplete(transaction);
-    const rows = await requestResult<ReplicaRow[]>(transaction.objectStore(ROWS_STORE).getAll());
-    await completion;
+    // Await both sides: a request whose result Chromium refuses to read (an oversized
+    // value in a damaged blob file) never settles, and awaiting it alone would hang the
+    // read forever instead of surfacing the aborted transaction.
+    const [rows] = await Promise.all([
+      requestResult<ReplicaRow[]>(transaction.objectStore(ROWS_STORE).getAll()),
+      completion,
+    ]);
     const hosts = new Map<string, ReplicaRow[]>();
     for (const row of rows) {
       const hostRows = hosts.get(row.serverId) ?? [];
@@ -159,8 +164,8 @@ export function createIndexedDbReplicaRowStore(
             store.getAll(IDBKeyRange.bound([serverId, kind], [serverId, kind, []])),
           ),
         );
-    const rows = (await Promise.all(requests)).flat();
-    await completion;
+    const [rowGroups] = await Promise.all([Promise.all(requests), completion]);
+    const rows = rowGroups.flat();
     return rows.sort((left, right) =>
       left.kind === right.kind
         ? left.id.localeCompare(right.id)
