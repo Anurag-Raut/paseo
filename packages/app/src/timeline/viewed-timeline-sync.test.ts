@@ -654,6 +654,73 @@ test("redeclaring unchanged visibility does not bypass catch-up backoff", async 
   expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("error");
 });
 
+test("a retry re-issues the request that failed instead of re-planning it", async () => {
+  const world = new TimelineWorld();
+  world.cursors.set("agent-a", { epoch: "cached-epoch", endSeq: 17 });
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const membership = await world.nextMembership();
+  membership.succeed();
+
+  const failed = await world.nextFetch("agent-a");
+  failed.fail("timeline unavailable");
+  const retryCatchUp = await world.nextRetry();
+
+  // A newer cached cursor must not move the retry off the page that failed.
+  world.cursors.set("agent-a", { epoch: "cached-epoch", endSeq: 99 });
+  retryCatchUp();
+
+  const retry = await world.nextFetch("agent-a");
+  expect(retry.request).toEqual(failed.request);
+  retry.respond({ hasNewer: false });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+});
+
+test("a membership change does not restart a failed catch-up ahead of its backoff", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const membership = await world.nextMembership();
+  membership.succeed();
+
+  const failed = await world.nextFetch("agent-a");
+  failed.fail("timeline unavailable");
+  await Promise.all([world.nextError(), world.nextRetry()]);
+  expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("error");
+
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a", "agent-b"]);
+  const nextMembership = await world.nextMembership();
+  nextMembership.succeed();
+
+  const agentB = await world.nextFetch("agent-b");
+  expect(world.pendingFetchCount).toBe(0);
+  expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("error");
+
+  agentB.respond({ hasNewer: false });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-b")).toBe("ready"));
+});
+
+test("returning to the app retries a failed catch-up without waiting out its backoff", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const membership = await world.nextMembership();
+  membership.succeed();
+
+  const failed = await world.nextFetch("agent-a");
+  failed.fail("timeline unavailable");
+  await Promise.all([world.nextError(), world.nextRetry()]);
+  expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("error");
+
+  world.sync.setActive(false);
+  world.sync.setActive(true);
+
+  const retry = await world.nextFetch("agent-a");
+  expect(retry.request).toEqual(failed.request);
+  retry.respond({ hasNewer: false });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+});
+
 test("a manual retry that fails returns to the error state", async () => {
   const world = new TimelineWorld();
   world.sync.setConnected(true);

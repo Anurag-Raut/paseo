@@ -574,6 +574,7 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
       if (page.hasNewer && page.endCursor) {
         if (fallbackToLatestTailOnOverflow) {
           await ports.fetchLatestTail(agentId);
+          if (!ownsCatchUp(agentId, generation)) return;
           catchUps.set(agentId, { generation, status: "complete" });
           setVisibilityCatchUpReady(agentId);
           return;
@@ -602,7 +603,11 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
         const cancelRetry = ports.schedule(() => {
           const current = catchUps.get(agentId);
           if (current?.generation !== generation || current.status !== "error") return;
-          startCatchUp(agentId);
+          // Retry the request that failed. A retry that cannot run yet — the host is
+          // reconnecting or membership is not acknowledged — parks the request for the
+          // next drain point instead of dropping it, and passing it keeps the backoff
+          // earned so far.
+          startCatchUp(agentId, { request });
         }, nextRetryDelayMs);
         catchUps.set(agentId, {
           generation,
@@ -679,8 +684,17 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
   };
 
   const startAcknowledgedCatchUps = () => {
-    for (const agentId of acknowledged) {
+    const visible = visibleAgentIds();
+    const ordered = [
+      ...visible.filter(isAcknowledged),
+      ...acknowledged.filter((agentId) => !visible.includes(agentId)),
+    ];
+    for (const agentId of ordered) {
       const pendingCatchUp = pendingCatchUps.get(agentId);
+      const current = catchUps.get(agentId);
+      // A membership change in one chat must not bypass another chat's backoff or
+      // supersede an in-flight tail that owns its parked gap recovery.
+      if (current && !(current.status === "complete" && pendingCatchUp)) continue;
       startCatchUp(agentId, {
         request: pendingCatchUp,
         supersede: Boolean(pendingCatchUp),
@@ -827,6 +841,23 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
       if (active === nextActive) return;
       active = nextActive;
       publishVisibleMembership();
+      if (!active) return;
+      // Returning to the app clears the backoff an unreachable host earned, so the
+      // visible agents retry now instead of waiting out a delay that measured a
+      // different condition. Agents that are already running or current are left alone.
+      let statusChanged = false;
+      for (const agentId of visibleAgentIds()) {
+        const status = catchUps.get(agentId)?.status;
+        if (status === "running" || status === "complete") continue;
+        if (!visibilityCatchUpPending.has(agentId)) {
+          visibilityCatchUpPending.add(agentId);
+          statusChanged = true;
+        }
+        if (visibilityCatchUpErrors.delete(agentId)) statusChanged = true;
+        if (manualRetries.delete(agentId)) statusChanged = true;
+        startCatchUp(agentId, { supersede: true });
+      }
+      if (statusChanged) notifyListeners();
     },
     setConnected(nextConnected) {
       if (connected === nextConnected) return;
