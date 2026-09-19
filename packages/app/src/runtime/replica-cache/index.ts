@@ -1213,6 +1213,13 @@ export class ReplicaCache {
           if (this.hasPendingChanges()) this.schedulePersist();
         }
         return undefined;
+      })
+      // Persisting is best-effort, and this chain is reached from fire-and-forget
+      // callers: a rejection that escapes here surfaces as an unhandled rejection
+      // instead of a cache that simply did not write.
+      .catch(() => {
+        if (this.hasPendingChanges()) this.schedulePersist();
+        return undefined;
       });
     this.writeQueue = write;
     await write;
