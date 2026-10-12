@@ -1,11 +1,8 @@
-import type { SessionMessageInfo } from "@opencode/client";
-import { OpenCodeV2AgentClient } from "./opencode/v2/agent.js";
-import { V2Harness } from "./opencode/test-utils/v2-harness.js";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
-import { describe, expect, test } from "vitest";
+import { expect, test } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
@@ -18,29 +15,63 @@ import { OpenCodeServerManager } from "./opencode/server-manager.js";
 
 test("dispatches ascending OpenCode message identifiers through the public provider path", async () => {
   const upstream = await createRecoveryUpstream();
-  const fixture = await createPublicRecoverySession(upstream, new RecoveryTiming());
-  const observed: AgentStreamEvent[] = [];
-  fixture.session.subscribe((event) => observed.push(event));
-  await upstream.connected(1);
-  upstream.send(0, connectedRecord());
-
-  await fixture.session.startTurn("first");
-  await upstream.dispatched(1);
-  upstream.send(0, idleRecord());
-  await eventually(() =>
-    expect(observed.filter((event) => event.type === "turn_completed")).toHaveLength(1),
+  const client = new OpenCodeAgentClient(
+    createTestLogger(),
+    {
+      command: {
+        mode: "replace",
+        argv: [
+          process.execPath,
+          "-e",
+          `setInterval(() => {}, 1000); fetch(${JSON.stringify(
+            `${upstream.url}/test/listening`,
+          )}).then(() => console.log("listening on test server"));`,
+          "--",
+        ],
+      },
+    },
+    {
+      resolveHomeDir: () => process.cwd(),
+      createClient: ({ directory }) => createOpencodeClient({ baseUrl: upstream.url, directory }),
+    },
   );
-  await fixture.session.startTurn("second");
-  const ids = await upstream.dispatched(2);
+  try {
+    const creating = client.createSession({
+      provider: "opencode",
+      cwd: "/workspace",
+    });
+    void creating.catch(() => undefined);
+    await upstream.awaitingListening();
+    // The process is alive but has not reported listening, so even a reachable endpoint must stay untouched.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(upstream.connectionCount()).toBe(0);
+    upstream.reportListening();
+    const session = await creating;
+    const observed: AgentStreamEvent[] = [];
+    session.subscribe((event) => observed.push(event));
+    await upstream.connected(1);
+    upstream.send(0, connectedRecord());
 
-  expect(ids).toHaveLength(2);
-  expect(ids[0]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
-  expect(ids[1]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
-  expect((ids[0] as string) < (ids[1] as string)).toBe(true);
+    await session.startTurn("first");
+    await upstream.dispatched(1);
+    upstream.send(0, idleRecord());
+    await eventually(() =>
+      expect(observed.filter((event) => event.type === "turn_completed")).toHaveLength(1),
+    );
+    await session.startTurn("second");
+    const ids = await upstream.dispatched(2);
 
-  await fixture.session.close();
-  await fixture.manager.shutdown();
-  await upstream.close();
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect(ids[1]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect((ids[0] as string) < (ids[1] as string)).toBe(true);
+
+    await session.close();
+  } finally {
+    upstream.reportListening();
+    await client.shutdown();
+    await upstream.close();
+  }
 });
 
 test("recovers missed output after EOF without failing the active turn", async () => {
@@ -172,6 +203,105 @@ test("orders queued live deltas behind an incomplete recovery snapshot and suppr
   await upstream.close();
 });
 
+test("sends the next turn to the new OpenCode server after the old one exits", async () => {
+  const exited = await createRecoveryUpstream();
+  const current = await createRecoveryUpstream();
+  const ports = [exited.port, current.port];
+  const processes: RecoveryServerProcess[] = [];
+  const manager = new OpenCodeServerManager({
+    logger: createTestLogger(),
+    portAllocator: async () => ports.shift() as number,
+    resolveCommandPrefix: async () => ({ command: "opencode", args: [] }),
+    resolveHomeDir: () => process.cwd(),
+    spawnServerProcess: () => {
+      const serverProcess = new RecoveryServerProcess();
+      processes.push(serverProcess);
+      return serverProcess as unknown as ChildProcess;
+    },
+    terminateProcess: async (serverProcess) => {
+      (serverProcess as unknown as RecoveryServerProcess).exit();
+      return "terminated";
+    },
+  });
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: manager,
+    createClient: ({ baseUrl, directory }) => createOpencodeClient({ baseUrl, directory }),
+  });
+  const session = await client.createSession({ provider: "opencode", cwd: "/workspace" });
+  const observed: AgentStreamEvent[] = [];
+  session.subscribe((event) => observed.push(event));
+  await exited.connected(1);
+  exited.send(0, connectedRecord());
+  processes[0]?.exit();
+  await exited.close();
+
+  const turn = session.startTurn("after restart");
+  await current.connected(1);
+  current.send(0, connectedRecord());
+  await turn;
+  await current.dispatched(1);
+  current.send(0, idleRecord());
+
+  await eventually(() => expect(observed.map((event) => event.type)).toContain("turn_completed"));
+  expect(observed.filter((event) => event.type === "turn_failed")).toHaveLength(0);
+
+  await session.close();
+  await manager.shutdown();
+  await current.close();
+});
+
+test("adds the session's MCP servers to the new OpenCode server after the old one exits", async () => {
+  const exited = await createRecoveryUpstream();
+  const current = await createRecoveryUpstream();
+  const ports = [exited.port, current.port];
+  const processes: RecoveryServerProcess[] = [];
+  const manager = new OpenCodeServerManager({
+    logger: createTestLogger(),
+    portAllocator: async () => ports.shift() as number,
+    resolveCommandPrefix: async () => ({ command: "opencode", args: [] }),
+    resolveHomeDir: () => process.cwd(),
+    spawnServerProcess: () => {
+      const serverProcess = new RecoveryServerProcess();
+      processes.push(serverProcess);
+      return serverProcess as unknown as ChildProcess;
+    },
+    terminateProcess: async (serverProcess) => {
+      (serverProcess as unknown as RecoveryServerProcess).exit();
+      return "terminated";
+    },
+  });
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: manager,
+    createClient: ({ baseUrl, directory }) => createOpencodeClient({ baseUrl, directory }),
+  });
+  const session = await client.createSession({
+    provider: "opencode",
+    cwd: "/workspace",
+    mcpServers: { paseo: { type: "http", url: "http://127.0.0.1:1/mcp" } },
+  });
+  await exited.connected(1);
+  exited.send(0, connectedRecord());
+  const firstTurn = session.startTurn("before restart");
+  await exited.dispatched(1);
+  exited.send(0, idleRecord());
+  await firstTurn;
+  expect(exited.mcpAdds()).toEqual(["paseo"]);
+  processes[0]?.exit();
+  await exited.close();
+
+  const turn = session.startTurn("after restart");
+  await current.connected(1);
+  current.send(0, connectedRecord());
+  await turn;
+  await current.dispatched(1);
+
+  expect(current.mcpAdds()).toEqual(["paseo"]);
+
+  await session.close();
+  await manager.shutdown();
+  await current.close();
+});
+
 class RecoveryTiming implements OpenCodeEventConsumerTiming {
   private resolveWait: (() => void) | null = null;
   arm(): () => void {
@@ -210,7 +340,10 @@ async function createPublicRecoverySession(
       serverProcess?.exit();
       return "terminated";
     },
-    createEventSource: (options) => new OpenCodeEventConsumer({ ...options, timing }),
+    createEventSource: (options) => {
+      expect(options.listening).toBeInstanceOf(Promise);
+      return new OpenCodeEventConsumer({ ...options, timing });
+    },
   });
   const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
     serverManager: manager,
@@ -242,12 +375,18 @@ class RecoveryServerProcess extends EventEmitter {
 
 async function createRecoveryUpstream() {
   const streams: ServerResponse[] = [];
+  let listeningResponse: ServerResponse | null = null;
   const dispatchIds: string[] = [];
+  const mcpAddNames: string[] = [];
   let messages: unknown[] = [];
   let messageReadCount = 0;
   let status: "busy" | "idle" = "idle";
   const server = createServer(async (request, response) => {
     const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+    if (pathname === "/test/listening") {
+      listeningResponse = response;
+      return;
+    }
     if (request.url?.startsWith("/global/event")) {
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.flushHeaders();
@@ -256,6 +395,11 @@ async function createRecoveryUpstream() {
     }
     if (request.method === "POST" && pathname === "/session") {
       return json(response, { id: "session-1", directory: "/workspace" });
+    }
+    if (request.method === "POST" && pathname === "/mcp") {
+      const body = JSON.parse(await readBody(request)) as { name: string };
+      mcpAddNames.push(body.name);
+      return json(response, {});
     }
     if (request.url?.includes("/prompt_async")) {
       const body = JSON.parse(await readBody(request)) as { messageID: string };
@@ -276,6 +420,10 @@ async function createRecoveryUpstream() {
   return {
     port: address.port,
     url: `http://127.0.0.1:${address.port}`,
+    awaitingListening: async () =>
+      expect.poll(() => listeningResponse, { timeout: 3_000 }).not.toBeNull(),
+    reportListening: () => listeningResponse?.end(),
+    connectionCount: () => streams.length,
     connected: async (count: number) => eventually(() => expect(streams).toHaveLength(count)),
     send(index: number, value: unknown) {
       streams[index]?.write(`data: ${JSON.stringify(value)}\n\n`);
@@ -288,6 +436,7 @@ async function createRecoveryUpstream() {
       return [...dispatchIds];
     },
     messageReads: () => messageReadCount,
+    mcpAdds: () => [...mcpAddNames],
     setMessages(nextMessages: unknown[]) {
       messages = nextMessages;
     },
@@ -459,344 +608,3 @@ async function eventually(assertion: () => void): Promise<void> {
   }
   assertion();
 }
-
-describe("OpenCode v2 lifecycle", () => {
-  test("fails initialization when the event stream ends before connecting", async () => {
-    const harness = new V2Harness();
-    harness.api.event.subscribe = async function* () {};
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    await expect(
-      client.createSession({ provider: "opencode", cwd: "/tmp/project" }),
-    ).rejects.toThrow("event stream ended before connecting");
-    expect(harness.releases).toBeGreaterThan(0);
-  });
-  test("returns only validated structured output and preserves it in history", async () => {
-    const harness = new V2Harness();
-    harness.prompt = async (input) => {
-      harness.history.push({
-        id: "user",
-        type: "user",
-        text: input.text,
-        metadata: input.metadata,
-        time: { created: 1 },
-      });
-      harness.history.push({
-        id: "answer",
-        type: "assistant",
-        agent: "build",
-        model: { providerID: "test", id: "model" },
-        time: { created: 2 },
-        content: [
-          { type: "text", text: "Here is the answer" },
-          {
-            type: "tool",
-            id: "output",
-            name: "paseo_structured_output",
-            time: { created: 2 },
-            state: {
-              status: "completed",
-              input: { value: { answer: 42 } },
-              content: [{ type: "text", text: "accepted" }],
-              metadata: { paseoStructuredOutput: { answer: 42 } },
-            },
-          },
-        ],
-      });
-    };
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
-    try {
-      const result = await session.run("answer", {
-        outputSchema: {
-          type: "object",
-          properties: { answer: { const: 42 } },
-          required: ["answer"],
-        },
-      });
-      expect(result.finalText).toBe('{"answer":42}');
-      const history = [];
-      for await (const event of session.streamHistory!()) history.push(event);
-      expect(history).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            type: "timeline",
-            item: expect.objectContaining({ type: "assistant_message", text: result.finalText }),
-          }),
-        ]),
-      );
-    } finally {
-      await session.close();
-    }
-  });
-
-  test("fails a structured turn when the model omits the validated output tool", async () => {
-    const harness = new V2Harness();
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
-    try {
-      await expect(session.run("answer", { outputSchema: { type: "object" } })).rejects.toThrow(
-        "without submitting the required structured output",
-      );
-    } finally {
-      await session.close();
-    }
-  });
-
-  test("resumes the native session ID and never replaces a missing session", async () => {
-    const harness = new V2Harness();
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const handle = {
-      provider: "opencode",
-      sessionId: "session",
-      nativeHandle: "session",
-      metadata: { cwd: "/tmp/project" },
-    } as const;
-    harness.api.session.switchAgent = async ({ agent }) => {
-      harness.info.agent = agent;
-    };
-    harness.api.session.switchModel = async ({ model }) => {
-      harness.info.model = model;
-    };
-    const session = await client.resumeSession(handle, {
-      modeId: "plan",
-      model: "synthetic/test",
-      thinkingOptionId: "low",
-    });
-    try {
-      expect(await session.getRuntimeInfo!()).toMatchObject({
-        modeId: "plan",
-        model: "synthetic/test",
-        thinkingOptionId: "low",
-      });
-      expect(await session.describePersistence()).toMatchObject({
-        sessionId: "session",
-        nativeHandle: "session",
-      });
-      expect(harness.creates).toEqual([]);
-    } finally {
-      await session.close();
-    }
-    harness.api.session.get = async () => {
-      throw new Error("Session not found");
-    };
-    await expect(client.resumeSession(handle)).rejects.toThrow("Session not found");
-    expect(harness.creates).toEqual([]);
-  });
-
-  test("reconciles reconnect snapshots without replaying text or losing repeated chunks", async () => {
-    const harness = new V2Harness();
-    let finish!: () => void;
-    harness.wait = () =>
-      new Promise<void>((resolve) => {
-        finish = resolve;
-      });
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
-    const chunks: string[] = [];
-    session.subscribe((event) => {
-      if (event.type === "timeline" && event.item.type === "assistant_message")
-        chunks.push(event.item.text);
-    });
-    try {
-      const running = session.run("laugh");
-      await expect.poll(() => typeof finish).toBe("function");
-      const answer = {
-        id: "answer",
-        type: "assistant",
-        agent: "build",
-        model: { providerID: "test", id: "model" },
-        time: { created: 2 },
-        content: [{ type: "text", text: "ha" }],
-      } satisfies SessionMessageInfo;
-      harness.history.push(answer);
-      harness.push({ id: "reconnect-1", created: 2, type: "server.connected", data: {} });
-      await expect.poll(() => chunks).toEqual(["ha"]);
-      answer.content[0].text = "haha";
-      harness.push({ id: "reconnect-2", created: 3, type: "server.connected", data: {} });
-      await expect.poll(() => chunks).toEqual(["ha", "ha"]);
-      finish();
-      expect((await running).finalText).toBe("haha");
-      expect(chunks).toEqual(["ha", "ha"]);
-    } finally {
-      await session.close();
-    }
-  });
-
-  test("reports a terminal failure when reading the execution error fails", async () => {
-    const harness = new V2Harness();
-    harness.info.outcome = "failed";
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
-    const events: AgentStreamEvent[] = [];
-    session.subscribe((event) => events.push(event));
-    try {
-      await session.startTurn("hello");
-      const failures = () => events.filter((event) => event.type === "turn_failed");
-      await expect.poll(failures).toHaveLength(1);
-      expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(0);
-    } finally {
-      await session.close();
-    }
-  });
-
-  test("waits for prompt acceptance before interrupting", async () => {
-    const harness = new V2Harness();
-    let accept!: () => void;
-    let settle!: () => void;
-    let interruptions = 0;
-    harness.prompt = () =>
-      new Promise<void>((resolve) => {
-        accept = resolve;
-      });
-    harness.wait = () =>
-      new Promise<void>((resolve) => {
-        settle = resolve;
-      });
-    harness.interrupt = async () => {
-      interruptions += 1;
-      harness.info.outcome = "interrupted";
-      settle();
-      return { interrupted: true };
-    };
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
-    try {
-      await session.startTurn("first");
-      const stopping = session.interrupt();
-      await Promise.resolve();
-      expect(interruptions).toBe(0);
-      accept();
-      await stopping;
-      expect(interruptions).toBe(1);
-    } finally {
-      await session.close();
-    }
-  });
-
-  test("completes a submitted turn once and reconciles its final text", async () => {
-    const harness = new V2Harness();
-    harness.prompt = async (input) => {
-      harness.prompts.push(input.text);
-      harness.history.push({
-        id: "answer",
-        type: "assistant",
-        agent: "build",
-        model: { providerID: "test", id: "model" },
-        time: { created: 2 },
-        content: [{ type: "text", text: "done" }],
-      });
-    };
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
-    const events: AgentStreamEvent[] = [];
-    session.subscribe((event) => events.push(event));
-    try {
-      const result = await session.run("hello");
-      expect(result.finalText).toBe("done");
-      expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
-      expect(harness.creates[0]).toMatchObject({
-        agent: "build",
-        location: { directory: "/tmp/project" },
-      });
-    } finally {
-      await session.close();
-    }
-    expect(harness.releases).toBe(1);
-  });
-
-  test("waits for interruption settlement before submitting replacement work", async () => {
-    const harness = new V2Harness();
-    let finishFirst!: () => void;
-    let finishStop!: () => void;
-    harness.wait = () =>
-      new Promise<void>((resolve) => {
-        finishFirst = resolve;
-      });
-    harness.interrupt = () =>
-      new Promise((resolve) => {
-        finishStop = () => {
-          harness.info.outcome = "interrupted";
-          finishFirst();
-          resolve({ interrupted: true });
-        };
-      });
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
-    try {
-      await session.startTurn("first");
-      await expect.poll(() => typeof finishFirst).toBe("function");
-      const stopping = session.interrupt();
-      const replacement = session.startTurn("second");
-      await Promise.resolve();
-      expect(harness.prompts).toEqual(["first"]);
-      harness.wait = async () => undefined;
-      finishStop();
-      await stopping;
-      await replacement;
-      await expect.poll(() => harness.prompts).toEqual(["first", "second"]);
-    } finally {
-      await session.close();
-    }
-  });
-
-  test("refuses replacement work after a failed stop until Stop succeeds", async () => {
-    const harness = new V2Harness();
-    let finishFirst!: () => void;
-    harness.wait = () =>
-      new Promise<void>((resolve) => {
-        finishFirst = resolve;
-      });
-    harness.interrupt = async () => {
-      throw new Error("stop failed");
-    };
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
-    try {
-      await session.startTurn("first");
-      await expect.poll(() => typeof finishFirst).toBe("function");
-      await expect(session.interrupt()).rejects.toThrow("stop failed");
-      await expect(session.startTurn("unsafe replacement")).rejects.toThrow("stop failed");
-      expect(harness.prompts).toEqual(["first"]);
-      harness.interrupt = async () => {
-        finishFirst();
-        return { interrupted: true };
-      };
-      await session.interrupt();
-      harness.wait = async () => undefined;
-      await session.startTurn("retry");
-      await expect.poll(() => harness.prompts).toEqual(["first", "retry"]);
-    } finally {
-      await session.close();
-    }
-  });
-});

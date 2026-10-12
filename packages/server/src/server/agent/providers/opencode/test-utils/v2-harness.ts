@@ -3,6 +3,7 @@ import type {
   SessionInfo,
   SessionMessageInfo,
   SessionCreateInput,
+  SessionLogItem,
 } from "@opencode/client";
 import type { V2Api } from "../v2/api.js";
 import type { V2Connection } from "../v2/runtime.js";
@@ -25,25 +26,78 @@ export class V2Harness {
   readonly history: SessionMessageInfo[] = [];
   readonly creates: SessionCreateInput[] = [];
   readonly prompts: string[] = [];
+  readonly environments: Array<{ sessionID: string; variables: Record<string, string> }> = [];
+  readonly mcpAdds: string[] = [];
   releases = 0;
+  active = false;
+  activeReads = 0;
+  autoComplete = true;
+  constructor(private sequence = 0) {}
+  private executions: SessionLogItem[] = [];
+  startExecution() {
+    this.active = true;
+    this.push({
+      id: `execution-${++this.sequence}`,
+      created: this.sequence,
+      type: "session.execution.started",
+      durable: { aggregateID: this.info.id, seq: this.sequence, version: 1 },
+      data: { sessionID: this.info.id },
+    });
+  }
+  finishExecution(outcome: "succeeded" | "interrupted" = "succeeded", publish = true) {
+    this.active = false;
+    this.info.outcome = outcome;
+    const common = {
+      id: `execution-${++this.sequence}`,
+      created: this.sequence,
+      durable: { aggregateID: this.info.id, seq: this.sequence, version: 1 as const },
+    };
+    this.push(
+      outcome === "succeeded"
+        ? { ...common, type: "session.execution.succeeded", data: { sessionID: this.info.id } }
+        : {
+            ...common,
+            type: "session.execution.interrupted",
+            data: { sessionID: this.info.id, reason: "user" },
+          },
+      publish,
+    );
+  }
   prompt: V2Api["session"]["prompt"] = async (input) => {
     this.prompts.push(input.text);
+    if (!this.autoComplete) this.startExecution();
   };
-  wait: V2Api["session"]["wait"] = async () => undefined;
   interrupt: V2Api["session"]["interrupt"] = async () => {
-    this.info.outcome = "interrupted";
+    this.finishExecution("interrupted");
     return { interrupted: true };
   };
   private pendingEvents: OpenCodeEvent[] = [];
   private notify: (() => void) | null = null;
-  push(event: OpenCodeEvent) {
+  push(event: OpenCodeEvent, publish = true) {
+    if (
+      event.type === "session.execution.started" ||
+      event.type === "session.execution.succeeded" ||
+      event.type === "session.execution.failed" ||
+      event.type === "session.execution.interrupted"
+    ) {
+      this.sequence = Math.max(this.sequence, event.durable.seq);
+      this.executions.push(event);
+    }
+    if (!publish) return;
     this.pendingEvents.push(event);
     this.notify?.();
   }
 
   readonly api: V2Api = {
-    health: { get: unexpected },
-    plugin: { awaitActivation: async () => undefined, list: unexpected },
+    server: { info: unexpected },
+    plugin: {
+      list: async () => ({
+        location: { directory: this.info.location.directory },
+        data: [
+          { id: "paseo", source: { type: "builtin" }, features: {}, state: { status: "active" } },
+        ],
+      }),
+    },
     agent: {
       list: async () => ({
         location: {
@@ -57,35 +111,59 @@ export class V2Harness {
     provider: { list: unexpected },
     command: { list: unexpected },
     skill: { list: unexpected },
-    mcp: { add: unexpected, list: unexpected },
+    mcp: {
+      add: async (input) => {
+        this.mcpAdds.push(input.server);
+      },
+      list: async (input) => ({
+        location: { directory: input?.location?.directory ?? this.info.location.directory },
+        data: this.mcpAdds.map((name) => ({
+          name,
+          status: { status: "connected" as const },
+        })),
+      }),
+    },
     message: {
       list: async (input) => {
         if (input.cursor && input.order) throw new Error("cursor cannot be combined with order");
         return { data: [...this.history], cursor: {} };
       },
     },
-    permission: { list: async () => [], reply: unexpected, rules: unexpected },
-    form: { list: async () => [], reply: unexpected, cancel: unexpected },
+    permission: { list: async () => [], reply: unexpected },
     session: {
+      form: { list: async () => [], reply: unexpected, cancel: unexpected },
       create: async (input = {}) => {
         this.creates.push(input);
         return this.info;
       },
       get: async () => this.info,
       list: async () => ({ data: [], cursor: {} }),
-      active: async () => ({}),
+      active: async () => {
+        this.activeReads += 1;
+        return this.active ? { [this.info.id]: { type: "running" as const } } : {};
+      },
       remove: async () => undefined,
       switchAgent: unexpected,
       switchModel: unexpected,
-      environment: unexpected,
+      environment: async (input) => {
+        this.environments.push(input);
+      },
       instructions: { entry: { list: unexpected, put: unexpected, remove: unexpected } },
-      prompt: (input, options) => this.prompt(input, options),
-      wait: (input, options) => this.wait(input, options),
+      prompt: async (input, options) => {
+        const before = this.executions.length;
+        await this.prompt(input, options);
+        if (
+          this.autoComplete &&
+          this.executions.length === before &&
+          this.info.outcome !== "failed"
+        )
+          this.finishExecution();
+      },
       interrupt: (input, options) => this.interrupt(input, options),
       command: unexpected,
       compact: unexpected,
       revert: { stage: unexpected, clear: unexpected, commit: unexpected },
-      log: unexpected,
+      log: (input) => this.executionLog(input.after),
     },
     event: { subscribe: (options) => this.events(options?.signal) },
   };
@@ -98,6 +176,12 @@ export class V2Harness {
     exited: new Promise<Error>(() => undefined),
   };
   readonly runtime = { acquire: async () => this.connection, shutdown: async () => undefined };
+
+  private async *executionLog(after = 0) {
+    for (const event of this.executions) {
+      if ("durable" in event && event.durable.seq > after) yield event;
+    }
+  }
 
   private async *events(signal?: AbortSignal): AsyncGenerator<OpenCodeEvent> {
     yield { id: "connected", created: 1, type: "server.connected", data: {} };

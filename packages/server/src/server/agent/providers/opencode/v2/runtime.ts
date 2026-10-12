@@ -33,7 +33,14 @@ export interface V2RuntimeOptions {
   logger: Logger;
   settings?: ProviderRuntimeSettings;
   managedProcesses?: ManagedProcessRegistry;
-  decorateEnv?: (env: Record<string, string>) => Record<string, string>;
+  decorateEnv?: (env: Record<string, string>) => Promise<Record<string, string>>;
+}
+
+export interface V2RuntimeAcquireOptions {
+  fresh?: boolean;
+  dedicated?: boolean;
+  env?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 // The runtime owns a credential for each subprocess; sessions only receive its authenticated client.
@@ -45,14 +52,7 @@ export class V2Runtime {
 
   constructor(private readonly options: V2RuntimeOptions) {}
 
-  async acquire(
-    input: {
-      fresh?: boolean;
-      dedicated?: boolean;
-      env?: Record<string, string>;
-      signal?: AbortSignal;
-    } = {},
-  ): Promise<V2Connection> {
+  async acquire(input: V2RuntimeAcquireOptions = {}): Promise<V2Connection> {
     if (this.closed) throw new Error("OpenCode runtime is closed");
     input.signal?.throwIfAborted();
     let pending: Promise<Generation>;
@@ -131,6 +131,14 @@ export class V2Runtime {
     const pending = this.start(env);
     this.starts.add(pending);
     void pending.then(
+      (generation) =>
+        generation.exited.then(() => {
+          if (this.current === pending) this.current = null;
+          return undefined;
+        }),
+      () => undefined,
+    );
+    void pending.then(
       () => this.starts.delete(pending),
       () => this.starts.delete(pending),
     );
@@ -153,7 +161,7 @@ export class V2Runtime {
       ...env,
     };
     const decorated = this.options.decorateEnv
-      ? this.options.decorateEnv(configured)
+      ? await this.options.decorateEnv(configured)
       : decorateOpenCodeV2Env(configured, await materializeOpenCodeV2Plugin(resolvePaseoHome()));
     const args = [...launch.args, "serve", "--hostname", "127.0.0.1", "--port", "0"];
     const process = spawnProcess(launch.command, args, {
@@ -244,7 +252,7 @@ export class V2Runtime {
           return response;
         },
       });
-      await client.health.get({ signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) });
+      await client.server.info({ signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) });
       const generation: Generation = { client, users: 0, stop, exited };
       this.generations.add(generation);
       process.once("exit", () => {

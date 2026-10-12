@@ -1,7 +1,7 @@
 import type { OpenCodeClient } from "@opencode/client";
 
 export interface V2Api {
-  health: OpenCodeClient["health"];
+  server: OpenCodeClient["server"];
   session: Pick<
     OpenCodeClient["session"],
     | "create"
@@ -16,12 +16,13 @@ export interface V2Api {
     | "prompt"
     | "command"
     | "compact"
-    | "wait"
     | "interrupt"
     | "revert"
     | "log"
-  >;
-  plugin: Pick<OpenCodeClient["plugin"], "awaitActivation" | "list">;
+  > & {
+    form: Pick<OpenCodeClient["session"]["form"], "list" | "reply" | "cancel">;
+  };
+  plugin: Pick<OpenCodeClient["plugin"], "list">;
   model: OpenCodeClient["model"];
   provider: Pick<OpenCodeClient["provider"], "list">;
   agent: Pick<OpenCodeClient["agent"], "list">;
@@ -29,7 +30,6 @@ export interface V2Api {
   skill: OpenCodeClient["skill"];
   message: OpenCodeClient["message"];
   mcp: Pick<OpenCodeClient["mcp"], "add" | "list">;
-  permission: Pick<OpenCodeClient["permission"], "list" | "reply" | "rules">;
-  form: Pick<OpenCodeClient["form"], "list" | "reply" | "cancel">;
+  permission: Pick<OpenCodeClient["permission"], "list" | "reply">;
   event: OpenCodeClient["event"];
 }
